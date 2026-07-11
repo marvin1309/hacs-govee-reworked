@@ -9,14 +9,18 @@ from govee_api_laggat.govee_dtos import GoveeSource
 from homeassistant.components.light import (
     ATTR_BRIGHTNESS,
     ATTR_COLOR_TEMP_KELVIN,
+    ATTR_EFFECT,
     ATTR_HS_COLOR,
     ColorMode,
     LightEntity,
+    LightEntityFeature,
 )
-from homeassistant.const import CONF_DELAY
+from homeassistant.const import CONF_API_KEY, CONF_DELAY
+from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 from homeassistant.util import color
 
+from . import govee_v2_scenes
 from .const import (
     DOMAIN,
     CONF_OFFLINE_IS_OFF,
@@ -35,6 +39,8 @@ async def async_setup_entry(hass, entry, async_add_entities):
     config = entry.data
     options = entry.options
     hub = hass.data[DOMAIN]["hub"]
+    # API key is reused for the Govee OpenAPI v2 scene/snapshot calls.
+    api_key = options.get(CONF_API_KEY, config.get(CONF_API_KEY, ""))
 
     # refresh
     update_interval = timedelta(
@@ -45,13 +51,13 @@ async def async_setup_entry(hass, entry, async_add_entities):
     )
     # Fetch initial data so we have data when entities subscribe
     hub.events.new_device += lambda device: add_entity(
-        async_add_entities, hub, entry, coordinator, device
+        async_add_entities, hub, entry, coordinator, device, api_key
     )
     await coordinator.async_refresh()
 
     # Add devices
     for device in hub.devices:
-        add_entity(async_add_entities, hub, entry, coordinator, device)
+        add_entity(async_add_entities, hub, entry, coordinator, device, api_key)
     # async_add_entities(
     #     [
     #         GoveeLightEntity(hub, entry.title, coordinator, device)
@@ -61,9 +67,9 @@ async def async_setup_entry(hass, entry, async_add_entities):
     # )
 
 
-def add_entity(async_add_entities, hub, entry, coordinator, device):
+def add_entity(async_add_entities, hub, entry, coordinator, device, api_key=""):
     async_add_entities(
-        [GoveeLightEntity(hub, entry.title, coordinator, device)],
+        [GoveeLightEntity(hub, entry.title, coordinator, device, api_key)],
         update_before_add=False,
     )
 
@@ -133,6 +139,7 @@ class GoveeLightEntity(LightEntity):
         title: str,
         coordinator: GoveeDataUpdateCoordinator,
         device: GoveeDevice,
+        api_key: str = "",
     ):
         """Init a Govee light strip."""
         self._hub = hub
@@ -140,6 +147,10 @@ class GoveeLightEntity(LightEntity):
         self._coordinator = coordinator
         self._device = device
         self._last_color_mode: ColorMode | None = None
+        # Govee OpenAPI v2 effects (scenes / snapshots / DIY): {name: capability}
+        self._api_key = api_key
+        self._effects: dict[str, dict] = {}
+        self._active_effect: str | None = None
 
     @property
     def entity_registry_enabled_default(self):
@@ -149,6 +160,66 @@ class GoveeLightEntity(LightEntity):
     async def async_added_to_hass(self):
         """Connect to dispatcher listening for entity data notifications."""
         self._coordinator.async_add_listener(self.async_write_ha_state)
+        # Load available scenes/snapshots in the background so startup is not
+        # blocked by the extra Govee OpenAPI v2 calls.
+        if self._api_key:
+            self.hass.async_create_task(self._async_load_effects())
+
+    async def _async_load_effects(self):
+        """Fetch dynamic scenes / snapshots / DIY effects from the v2 API."""
+        try:
+            session = async_get_clientsession(self.hass)
+            self._effects = await govee_v2_scenes.async_fetch_effects(
+                session, self._api_key, self._device.model, self._device.device
+            )
+        except Exception as ex:  # pragma: no cover - defensive, never break light
+            _LOGGER.debug(
+                "Could not load Govee v2 effects for %s: %s", self._device.device, ex
+            )
+            return
+        if self._effects:
+            self.async_write_ha_state()
+
+    @property
+    def supported_features(self) -> LightEntityFeature:
+        """Return supported features (EFFECT once scenes are discovered)."""
+        if self._effects:
+            return LightEntityFeature.EFFECT
+        return LightEntityFeature(0)
+
+    @property
+    def effect_list(self) -> list[str] | None:
+        """Return the list of available effects (scenes/snapshots/DIY)."""
+        if not self._effects:
+            return None
+        return sorted(self._effects)
+
+    @property
+    def effect(self) -> str | None:
+        """Return the currently active effect, if any."""
+        return self._active_effect
+
+    async def _async_set_effect(self, name: str) -> bool:
+        """Activate an effect via the Govee OpenAPI v2 control endpoint."""
+        capability = self._effects.get(name)
+        if capability is None:
+            _LOGGER.warning(
+                "Unknown effect '%s' for %s", name, self._device.device
+            )
+            return False
+        session = async_get_clientsession(self.hass)
+        ok = await govee_v2_scenes.async_set_effect(
+            session,
+            self._api_key,
+            self._device.model,
+            self._device.device,
+            capability,
+        )
+        if not ok:
+            _LOGGER.warning(
+                "Failed to set effect '%s' for %s", name, self._device.device
+            )
+        return ok
 
     @property
     def _state(self):
@@ -210,9 +281,17 @@ class GoveeLightEntity(LightEntity):
         err = None
 
         just_turn_on = True
+        # Effect (scene / snapshot / DIY) via Govee OpenAPI v2. Handle first so
+        # an explicit color/brightness command below can still override it.
+        if ATTR_EFFECT in kwargs:
+            effect = kwargs.pop(ATTR_EFFECT)
+            just_turn_on = False
+            if await self._async_set_effect(effect):
+                self._active_effect = effect
         if ATTR_HS_COLOR in kwargs:
             hs_color = kwargs.pop(ATTR_HS_COLOR)
             self._last_color_mode = ColorMode.HS
+            self._active_effect = None
             just_turn_on = False
             col = color.color_hs_to_RGB(hs_color[0], hs_color[1])
             _, err = await self._hub.set_color(self._device, col)
@@ -235,6 +314,7 @@ class GoveeLightEntity(LightEntity):
         if ATTR_COLOR_TEMP_KELVIN in kwargs:
             color_temp = kwargs.pop(ATTR_COLOR_TEMP_KELVIN)
             self._last_color_mode = ColorMode.COLOR_TEMP
+            self._active_effect = None
             just_turn_on = False
             if color_temp > COLOR_TEMP_KELVIN_MAX:
                 color_temp = COLOR_TEMP_KELVIN_MAX
